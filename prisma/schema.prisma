@@ -1,0 +1,226 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  ADMIN
+  USER
+}
+
+enum SessionStatus {
+  CREATED
+  QR_CODE
+  CONNECTING
+  CONNECTED
+  DISCONNECTED
+  LOGGED_OUT
+}
+
+enum ConversationType {
+  ONE_TO_ONE
+  GROUP
+}
+
+enum MessageDirection {
+  INBOUND
+  OUTBOUND
+}
+
+enum SenderType {
+  CONTACT
+  USER
+  AI
+  SYSTEM
+}
+
+enum MessageType {
+  TEXT
+  IMAGE
+  DOCUMENT
+  AUDIO
+  VIDEO
+  SYSTEM
+}
+
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum TaskStatus {
+  DRAFT
+  SCHEDULED
+  ACTIVE
+  WAITING_FOR_CONTACT
+  WAITING_FOR_USER
+  PAUSED
+  COMPLETED
+  FAILED
+  CANCELLED
+  HUMAN_REQUIRED
+}
+
+enum AutonomyLevel {
+  FULL_AUTO
+  LIMITED_AUTO
+  HUMAN_APPROVAL
+}
+
+enum GeminiKeyStatus {
+  ACTIVE
+  INACTIVE
+  COOLDOWN
+  DISABLED
+  INVALID
+  RATE_LIMITED
+}
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String
+  name         String?
+  role         UserRole @default(ADMIN)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model WhatsAppSession {
+  id            String          @id @default(uuid())
+  name          String
+  sessionName   String          @unique
+  status        SessionStatus   @default(CREATED)
+  phoneNumber   String?
+  qrCode        String?         @db.Text
+  connectedAt   DateTime?
+  lastSeenAt    DateTime?
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+  conversations Conversation[]
+}
+
+model Contact {
+  id                String         @id @default(uuid())
+  whatsappId        String         @unique
+  phoneNumber       String?
+  name              String?
+  pushName          String?
+  profilePictureUrl String?
+  notes             String?        @db.Text
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+  conversations     Conversation[]
+  tasks             Task[]
+}
+
+model Conversation {
+  id                String           @id @default(uuid())
+  whatsappSessionId String
+  contactId         String
+  whatsappChatId    String           @unique
+  type              ConversationType @default(ONE_TO_ONE)
+  lastMessageAt     DateTime?
+  autonomousMode    Boolean          @default(true)
+  summary           String?          @db.Text
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+
+  whatsappSession WhatsAppSession @relation(fields: [whatsappSessionId], references: [id], onDelete: Cascade)
+  contact         Contact         @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  messages        Message[]
+  tasks           Task[]
+  auditLogs       AuditLog[]
+}
+
+model Message {
+  id                String           @id @default(uuid())
+  conversationId    String
+  whatsappMessageId String           @unique
+  direction         MessageDirection
+  senderType        SenderType
+  body              String           @db.Text
+  messageType       MessageType      @default(TEXT)
+  quotedMessageId   String?
+  timestamp         DateTime         @default(now())
+  hasMedia          Boolean          @default(false)
+  mediaType         String?
+  mediaUrl          String?
+  rawMetadata       Json?
+  createdAt         DateTime         @default(now())
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+}
+
+model Task {
+  id                      String        @id @default(uuid())
+  contactId               String
+  conversationId          String?
+  title                   String
+  objective               String        @db.Text
+  instructions            String?       @db.Text
+  successCriteria         String?       @db.Text
+  failureCriteria         String?       @db.Text
+  constraints             String?       @db.Text
+  priority                TaskPriority  @default(MEDIUM)
+  status                  TaskStatus    @default(DRAFT)
+  autonomyLevel           AutonomyLevel @default(FULL_AUTO)
+  scheduledStartAt        DateTime?
+  deadlineAt              DateTime?
+  nextActionAt            DateTime?
+  maxMessages             Int           @default(10)
+  maxConversationDuration Int?
+  messageCount            Int           @default(0)
+  createdAt               DateTime      @default(now())
+  updatedAt               DateTime      @updatedAt
+  completedAt             DateTime?
+
+  contact      Contact       @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  conversation Conversation? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+  auditLogs    AuditLog[]
+}
+
+model GeminiKey {
+  id             String          @id @default(uuid())
+  name           String?
+  encryptedKey   String          @db.Text
+  keyFingerprint String          @unique
+  last4          String
+  status         GeminiKeyStatus @default(ACTIVE)
+  requestCount   Int             @default(0)
+  errorCount     Int             @default(0)
+  lastUsedAt     DateTime?
+  lastErrorAt    DateTime?
+  cooldownUntil  DateTime?
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+}
+
+model AuditLog {
+  id             String    @id @default(uuid())
+  taskId         String?
+  conversationId String?
+  action         String
+  decision       String?
+  reason         String?   @db.Text
+  confidence     Float?
+  details        Json?
+  createdAt      DateTime  @default(now())
+
+  task         Task?         @relation(fields: [taskId], references: [id], onDelete: SetNull)
+  conversation Conversation? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+}
+
+model SystemSetting {
+  id          String   @id @default(uuid())
+  key         String   @unique
+  value       String   @db.Text
+  description String?
+  updatedAt   DateTime @updatedAt
+}
