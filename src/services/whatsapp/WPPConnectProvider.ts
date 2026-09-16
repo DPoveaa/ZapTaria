@@ -32,12 +32,12 @@ export class WPPConnectProvider implements WhatsAppProvider {
       this.client = await wppconnect.create({
         session: sessionName,
         folderNameToken: this.sessionDataDir,
-        catchQR: (base64Qr) => {
+        catchQR: (base64Qr: string) => {
           this.qrCode = base64Qr;
           this.status = 'QR_CODE';
           events?.onSessionStatusChange?.('QR_CODE', base64Qr);
         },
-        statusFind: (statusSession) => {
+        statusFind: (statusSession: string) => {
           if (statusSession === 'isLogged' || statusSession === 'inChat') {
             this.status = 'CONNECTED';
             this.qrCode = null;
@@ -47,10 +47,10 @@ export class WPPConnectProvider implements WhatsAppProvider {
             events?.onSessionStatusChange?.('DISCONNECTED');
           }
         },
-        headless: 'new',
+        headless: true,
         useChrome: false,
         logQR: false,
-      });
+      } as any);
 
       this.status = 'CONNECTED';
       events?.onSessionStatusChange?.('CONNECTED');
@@ -87,9 +87,9 @@ export class WPPConnectProvider implements WhatsAppProvider {
   public async getContacts(): Promise<WhatsAppContact[]> {
     if (!this.client) throw new Error('WPPConnect client not initialized');
     const rawContacts = await this.client.getAllContacts();
-    return rawContacts.map(c => ({
-      id: c.id._serialized,
-      phoneNumber: c.id.user,
+    return rawContacts.map((c: any) => ({
+      id: typeof c.id === 'object' ? c.id._serialized : c.id,
+      phoneNumber: typeof c.id === 'object' ? c.id.user : c.id?.split?.('@')[0] || '',
       name: c.name || c.formattedName,
       pushName: c.pushname,
       profilePictureUrl: (c as any).profilePicThumbObj?.eurl || undefined,
@@ -99,10 +99,10 @@ export class WPPConnectProvider implements WhatsAppProvider {
   public async getChats(): Promise<WhatsAppChat[]> {
     if (!this.client) throw new Error('WPPConnect client not initialized');
     const rawChats = await this.client.getAllChats();
-    return rawChats.map(chat => ({
-      id: chat.id._serialized,
+    return rawChats.map((chat: any) => ({
+      id: typeof chat.id === 'object' ? chat.id._serialized : chat.id,
       name: chat.name || (chat as any).formattedTitle,
-      isGroup: chat.isGroup,
+      isGroup: Boolean(chat.isGroup),
       unreadCount: chat.unreadCount || 0,
       lastMessageTimestamp: chat.t,
     }));
