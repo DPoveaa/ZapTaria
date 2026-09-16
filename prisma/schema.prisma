@@ -82,6 +82,14 @@ enum GeminiKeyStatus {
   RATE_LIMITED
 }
 
+enum ScheduledActionStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
 model User {
   id           String   @id @default(uuid())
   email        String   @unique
@@ -181,9 +189,41 @@ model Task {
   updatedAt               DateTime      @updatedAt
   completedAt             DateTime?
 
-  contact      Contact       @relation(fields: [contactId], references: [id], onDelete: Cascade)
-  conversation Conversation? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
-  auditLogs    AuditLog[]
+  contact          Contact           @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  conversation     Conversation?     @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+  auditLogs        AuditLog[]
+  taskMemory       TaskMemory?
+  scheduledActions ScheduledAction[]
+}
+
+model TaskMemory {
+  id                 String   @id @default(uuid())
+  taskId             String   @unique
+  goal               String   @db.Text
+  knownFacts         Json     @default("[]")
+  openQuestions      Json     @default("[]")
+  contactCommitments Json     @default("[]")
+  lastRelevantState  String?
+  updatedAt          DateTime @updatedAt
+
+  task Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+}
+
+model ScheduledAction {
+  id             String                @id @default(uuid())
+  taskId         String
+  type           String
+  scheduledFor   DateTime
+  status         ScheduledActionStatus @default(PENDING)
+  attempts       Int                   @default(0)
+  lastAttemptAt  DateTime?
+  completedAt    DateTime?
+  payload        Json?
+  idempotencyKey String                @unique
+  error          String?               @db.Text
+  createdAt      DateTime              @default(now())
+
+  task Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
 }
 
 model GeminiKey {

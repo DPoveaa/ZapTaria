@@ -1,4 +1,6 @@
 import wppconnect from '@wppconnect-team/wppconnect';
+import path from 'path';
+import fs from 'fs';
 import {
   WhatsAppProvider,
   WhatsAppContact,
@@ -13,6 +15,14 @@ export class WPPConnectProvider implements WhatsAppProvider {
   private client: wppconnect.Whatsapp | null = null;
   private status: WhatsAppSessionStatus = 'CREATED';
   private qrCode: string | null = null;
+  private sessionDataDir: string;
+
+  constructor(sessionDataDir: string = '.wppconnect_sessions') {
+    this.sessionDataDir = path.resolve(process.cwd(), sessionDataDir);
+    if (!fs.existsSync(this.sessionDataDir)) {
+      fs.mkdirSync(this.sessionDataDir, { recursive: true });
+    }
+  }
 
   public async connectSession(sessionName: string, events?: WhatsAppProviderEvents): Promise<void> {
     this.status = 'CONNECTING';
@@ -21,6 +31,7 @@ export class WPPConnectProvider implements WhatsAppProvider {
     try {
       this.client = await wppconnect.create({
         session: sessionName,
+        folderNameToken: this.sessionDataDir,
         catchQR: (base64Qr) => {
           this.qrCode = base64Qr;
           this.status = 'QR_CODE';
@@ -44,7 +55,6 @@ export class WPPConnectProvider implements WhatsAppProvider {
       this.status = 'CONNECTED';
       events?.onSessionStatusChange?.('CONNECTED');
 
-      // Listen for incoming messages
       this.client.onMessage((msg) => {
         if (!events?.onIncomingMessage) return;
         const normalized = this.normalizeMessage(msg);

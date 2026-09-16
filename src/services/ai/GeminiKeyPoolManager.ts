@@ -1,4 +1,4 @@
-import { GeminiKeyStatus } from '@prisma/client';
+import { PrismaClient, GeminiKeyStatus } from '@prisma/client';
 import {
   normalizeKey,
   encryptKey,
@@ -48,64 +48,84 @@ export interface KeyImportResult {
 }
 
 export class GeminiKeyPoolManager {
-  private inMemoryKeys: Map<string, KeyRecord> = new Map();
+  private prisma?: PrismaClient;
   private rotationIndex = 0;
   private strategy: 'ROUND_ROBIN' | 'LEAST_RECENTLY_USED' = 'ROUND_ROBIN';
+  private inMemoryFallback: Map<string, KeyRecord> = new Map();
 
-  constructor(strategy: 'ROUND_ROBIN' | 'LEAST_RECENTLY_USED' = 'ROUND_ROBIN') {
+  constructor(strategy: 'ROUND_ROBIN' | 'LEAST_RECENTLY_USED' = 'ROUND_ROBIN', prisma?: PrismaClient) {
     this.strategy = strategy;
+    this.prisma = prisma;
   }
 
   public setStrategy(strategy: 'ROUND_ROBIN' | 'LEAST_RECENTLY_USED') {
     this.strategy = strategy;
   }
 
-  public addKeyInMemory(rawKey: string, name?: string): { success: boolean; duplicate: boolean; key?: KeyMaskedMetadata } {
+  public async addKey(rawKey: string, name?: string): Promise<{ success: boolean; duplicate: boolean; key?: KeyMaskedMetadata }> {
     const normalized = normalizeKey(rawKey);
-    if (!normalized) {
-      return { success: false, duplicate: false };
-    }
+    if (!normalized) return { success: false, duplicate: false };
 
     const fingerprint = calculateKeyFingerprint(normalized);
-
-    // Check duplicate against in-memory records
-    for (const keyRecord of this.inMemoryKeys.values()) {
-      if (keyRecord.keyFingerprint === fingerprint) {
-        return { success: false, duplicate: true };
-      }
-    }
-
     const encrypted = encryptKey(normalized);
     const last4 = extractLast4(normalized);
-    const id = 'key_' + Math.random().toString(36).substring(2, 11);
-    const now = new Date();
 
-    const newRecord: KeyRecord = {
-      id,
-      name: name || `Key ${last4}`,
-      encryptedKey: encrypted,
-      keyFingerprint: fingerprint,
-      last4,
-      status: 'ACTIVE',
-      requestCount: 0,
-      errorCount: 0,
-      lastUsedAt: null,
-      lastErrorAt: null,
-      cooldownUntil: null,
-      createdAt: now,
-      updatedAt: now,
-    };
+    if (this.prisma) {
+      try {
+        const existing = await this.prisma.geminiKey.findUnique({ where: { keyFingerprint: fingerprint } });
+        if (existing) {
+          return { success: false, duplicate: true };
+        }
 
-    this.inMemoryKeys.set(id, newRecord);
+        const created = await this.prisma.geminiKey.create({
+          data: {
+            name: name || `Key ${last4}`,
+            encryptedKey: encrypted,
+            keyFingerprint: fingerprint,
+            last4,
+            status: 'ACTIVE'
+          }
+        });
 
-    return {
-      success: true,
-      duplicate: false,
-      key: this.toMaskedMetadata(newRecord),
-    };
+        return {
+          success: true,
+          duplicate: false,
+          key: this.toMaskedMetadata(created)
+        };
+      } catch (err: any) {
+        if (err?.code === 'P2002' || err?.message?.includes('unique constraint')) {
+          return { success: false, duplicate: true };
+        }
+        return { success: false, duplicate: false };
+      }
+    } else {
+      // In-memory fallback
+      for (const rec of this.inMemoryFallback.values()) {
+        if (rec.keyFingerprint === fingerprint) return { success: false, duplicate: true };
+      }
+      const id = 'key_' + Math.random().toString(36).substring(2, 11);
+      const now = new Date();
+      const rec: KeyRecord = {
+        id,
+        name: name || `Key ${last4}`,
+        encryptedKey: encrypted,
+        keyFingerprint: fingerprint,
+        last4,
+        status: 'ACTIVE',
+        requestCount: 0,
+        errorCount: 0,
+        lastUsedAt: null,
+        lastErrorAt: null,
+        cooldownUntil: null,
+        createdAt: now,
+        updatedAt: now
+      };
+      this.inMemoryFallback.set(id, rec);
+      return { success: true, duplicate: false, key: this.toMaskedMetadata(rec) };
+    }
   }
 
-  public addBulkKeysInMemory(rawText: string): KeyImportResult {
+  public async addBulkKeys(rawText: string): Promise<KeyImportResult> {
     const keys = parseBulkKeys(rawText);
     let added = 0;
     let duplicates = 0;
@@ -113,11 +133,11 @@ export class GeminiKeyPoolManager {
     const addedKeys: KeyMaskedMetadata[] = [];
 
     for (const rawKey of keys) {
-      const result = this.addKeyInMemory(rawKey);
-      if (result.success && result.key) {
+      const res = await this.addKey(rawKey);
+      if (res.success && res.key) {
         added++;
-        addedKeys.push(result.key);
-      } else if (result.duplicate) {
+        addedKeys.push(res.key);
+      } else if (res.duplicate) {
         duplicates++;
       } else {
         failed++;
@@ -129,82 +149,129 @@ export class GeminiKeyPoolManager {
       added,
       duplicates,
       failed,
-      addedKeys,
+      addedKeys
     };
   }
 
-  public getNextActiveKey(): { id: string; plaintextKey: string } | null {
+  public async getNextActiveKey(): Promise<{ id: string; plaintextKey: string } | null> {
     const now = new Date();
-    const eligibleKeys: KeyRecord[] = [];
 
-    for (const keyRecord of this.inMemoryKeys.values()) {
-      if (keyRecord.status === 'ACTIVE') {
-        if (!keyRecord.cooldownUntil || keyRecord.cooldownUntil <= now) {
-          eligibleKeys.push(keyRecord);
+    if (this.prisma) {
+      const activeKeys = await this.prisma.geminiKey.findMany({
+        where: {
+          status: 'ACTIVE',
+          OR: [
+            { cooldownUntil: null },
+            { cooldownUntil: { lte: now } }
+          ]
         }
+      });
+
+      if (activeKeys.length === 0) return null;
+
+      let selected: KeyRecord;
+      if (this.strategy === 'LEAST_RECENTLY_USED') {
+        activeKeys.sort((a, b) => (a.lastUsedAt?.getTime() || 0) - (b.lastUsedAt?.getTime() || 0));
+        selected = activeKeys[0] as any;
+      } else {
+        this.rotationIndex = this.rotationIndex % activeKeys.length;
+        selected = activeKeys[this.rotationIndex] as any;
+        this.rotationIndex = (this.rotationIndex + 1) % activeKeys.length;
+      }
+
+      await this.prisma.geminiKey.update({
+        where: { id: selected.id },
+        data: {
+          lastUsedAt: now,
+          requestCount: { increment: 1 }
+        }
+      });
+
+      const plaintextKey = decryptKey(selected.encryptedKey);
+      return { id: selected.id, plaintextKey };
+    } else {
+      // In-memory fallback
+      const eligible = Array.from(this.inMemoryFallback.values()).filter(
+        k => k.status === 'ACTIVE' && (!k.cooldownUntil || k.cooldownUntil <= now)
+      );
+      if (eligible.length === 0) return null;
+
+      let selected: KeyRecord;
+      if (this.strategy === 'LEAST_RECENTLY_USED') {
+        eligible.sort((a, b) => (a.lastUsedAt?.getTime() || 0) - (b.lastUsedAt?.getTime() || 0));
+        selected = eligible[0];
+      } else {
+        this.rotationIndex = this.rotationIndex % eligible.length;
+        selected = eligible[this.rotationIndex];
+        this.rotationIndex = (this.rotationIndex + 1) % eligible.length;
+      }
+
+      selected.lastUsedAt = now;
+      selected.requestCount += 1;
+      selected.updatedAt = now;
+
+      const plaintextKey = decryptKey(selected.encryptedKey);
+      return { id: selected.id, plaintextKey };
+    }
+  }
+
+  public async recordError(id: string, error: any): Promise<void> {
+    const now = new Date();
+    const status = error?.status || error?.statusCode;
+    const isRateLimitOrQuota = status === 429 || error?.message?.includes('429') || error?.message?.includes('quota');
+    const isAuthError = status === 401 || status === 403 || error?.message?.includes('API key');
+
+    if (this.prisma) {
+      const rec = await this.prisma.geminiKey.findUnique({ where: { id } });
+      if (!rec) return;
+
+      let newStatus: GeminiKeyStatus = rec.status;
+      let cooldownUntil: Date | null = rec.cooldownUntil;
+
+      if (isRateLimitOrQuota) {
+        newStatus = 'RATE_LIMITED';
+        cooldownUntil = new Date(now.getTime() + 15 * 60 * 1000); // 15 mins
+      } else if (isAuthError) {
+        newStatus = 'INVALID';
+      } else if (rec.errorCount + 1 >= 5) {
+        newStatus = 'DISABLED';
+      }
+
+      await this.prisma.geminiKey.update({
+        where: { id },
+        data: {
+          errorCount: { increment: 1 },
+          lastErrorAt: now,
+          status: newStatus,
+          cooldownUntil
+        }
+      });
+    } else {
+      const rec = this.inMemoryFallback.get(id);
+      if (!rec) return;
+      rec.errorCount += 1;
+      rec.lastErrorAt = now;
+      if (isRateLimitOrQuota) {
+        rec.status = 'RATE_LIMITED';
+        rec.cooldownUntil = new Date(now.getTime() + 15 * 60 * 1000);
+      } else if (isAuthError) {
+        rec.status = 'INVALID';
+      } else if (rec.errorCount >= 5) {
+        rec.status = 'DISABLED';
       }
     }
+  }
 
-    if (eligibleKeys.length === 0) {
-      return null;
-    }
-
-    let selected: KeyRecord;
-
-    if (this.strategy === 'LEAST_RECENTLY_USED') {
-      eligibleKeys.sort((a, b) => {
-        const timeA = a.lastUsedAt ? a.lastUsedAt.getTime() : 0;
-        const timeB = b.lastUsedAt ? b.lastUsedAt.getTime() : 0;
-        return timeA - timeB;
-      });
-      selected = eligibleKeys[0];
+  public async listMaskedKeys(): Promise<KeyMaskedMetadata[]> {
+    if (this.prisma) {
+      const keys = await this.prisma.geminiKey.findMany({ orderBy: { createdAt: 'desc' } });
+      return keys.map(k => this.toMaskedMetadata(k));
     } else {
-      // ROUND_ROBIN
-      this.rotationIndex = this.rotationIndex % eligibleKeys.length;
-      selected = eligibleKeys[this.rotationIndex];
-      this.rotationIndex = (this.rotationIndex + 1) % eligibleKeys.length;
-    }
-
-    // Update usage metadata
-    selected.lastUsedAt = now;
-    selected.requestCount += 1;
-    selected.updatedAt = now;
-
-    const plaintextKey = decryptKey(selected.encryptedKey);
-    return { id: selected.id, plaintextKey };
-  }
-
-  public recordError(id: string, isQuotaOrRateLimit: boolean = false) {
-    const record = this.inMemoryKeys.get(id);
-    if (!record) return;
-
-    const now = new Date();
-    record.errorCount += 1;
-    record.lastErrorAt = now;
-    record.updatedAt = now;
-
-    if (isQuotaOrRateLimit) {
-      // 15-minute cooldown
-      record.cooldownUntil = new Date(now.getTime() + 15 * 60 * 1000);
-      record.status = 'RATE_LIMITED';
-    } else if (record.errorCount >= 5) {
-      record.status = 'DISABLED';
+      return Array.from(this.inMemoryFallback.values()).map(k => this.toMaskedMetadata(k));
     }
   }
 
-  public listMaskedKeys(): KeyMaskedMetadata[] {
-    return Array.from(this.inMemoryKeys.values()).map(k => this.toMaskedMetadata(k));
-  }
-
-  public getKeyRecord(id: string): KeyRecord | undefined {
-    return this.inMemoryKeys.get(id);
-  }
-
-  public removeKey(id: string): boolean {
-    return this.inMemoryKeys.delete(id);
-  }
-
-  private toMaskedMetadata(record: KeyRecord): KeyMaskedMetadata {
+  private toMaskedMetadata(record: any): KeyMaskedMetadata {
     return {
       id: record.id,
       name: record.name,

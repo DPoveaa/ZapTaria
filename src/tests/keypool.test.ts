@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { encryptKey, decryptKey, calculateKeyFingerprint, maskKey, parseBulkKeys } from '../services/security/crypto.js';
+import { encryptKey, decryptKey, calculateKeyFingerprint, maskKey } from '../services/security/crypto.js';
 import { GeminiKeyPoolManager } from '../services/ai/GeminiKeyPoolManager.js';
 
 describe('Security Crypto & Key Pool', () => {
@@ -28,7 +28,7 @@ describe('Security Crypto & Key Pool', () => {
     expect(masked).toBe('••••••••••••7890');
   });
 
-  it('should handle bulk insertion and duplicate detection in KeyPoolManager', () => {
+  it('should handle bulk insertion and duplicate detection in KeyPoolManager', async () => {
     const pool = new GeminiKeyPoolManager('ROUND_ROBIN');
     const bulkText = `
       AIzaSyTestKey0001
@@ -36,24 +36,24 @@ describe('Security Crypto & Key Pool', () => {
       AIzaSyTestKey0001
     `;
 
-    const result = pool.addBulkKeysInMemory(bulkText);
+    const result = await pool.addBulkKeys(bulkText);
     expect(result.submitted).toBe(3);
     expect(result.added).toBe(2);
     expect(result.duplicates).toBe(1);
 
-    const keys = pool.listMaskedKeys();
+    const keys = await pool.listMaskedKeys();
     expect(keys).toHaveLength(2);
     expect(keys[0].maskedKey).toBe('••••••••••••0001');
   });
 
-  it('should rotate keys using ROUND_ROBIN strategy', () => {
+  it('should rotate keys using ROUND_ROBIN strategy', async () => {
     const pool = new GeminiKeyPoolManager('ROUND_ROBIN');
-    pool.addKeyInMemory('Key1');
-    pool.addKeyInMemory('Key2');
+    await pool.addKey('Key1');
+    await pool.addKey('Key2');
 
-    const key1 = pool.getNextActiveKey();
-    const key2 = pool.getNextActiveKey();
-    const key3 = pool.getNextActiveKey();
+    const key1 = await pool.getNextActiveKey();
+    const key2 = await pool.getNextActiveKey();
+    const key3 = await pool.getNextActiveKey();
 
     expect(key1?.plaintextKey).toBe('Key1');
     expect(key2?.plaintextKey).toBe('Key2');

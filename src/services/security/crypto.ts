@@ -3,6 +3,25 @@ import crypto from 'crypto';
 const ALGORITHM = 'aes-256-gcm';
 const IV_LENGTH = 12;
 
+export function validateProductionSecrets(): void {
+  const isProd = process.env.NODE_ENV === 'production' || process.env.APP_MODE === 'PRODUCTION';
+  const encKey = process.env.ENCRYPTION_KEY;
+  const fpSecret = process.env.KEY_FINGERPRINT_SECRET;
+  const sessionSecret = process.env.SESSION_SECRET;
+
+  if (isProd) {
+    if (!encKey || encKey.length !== 64) {
+      throw new Error('FATAL_SECURITY_ERROR: ENCRYPTION_KEY must be a valid 64-character hex string (32 bytes)');
+    }
+    if (!fpSecret || fpSecret.length < 32) {
+      throw new Error('FATAL_SECURITY_ERROR: KEY_FINGERPRINT_SECRET must be at least 32 characters long');
+    }
+    if (!sessionSecret || sessionSecret.length < 32) {
+      throw new Error('FATAL_SECURITY_ERROR: SESSION_SECRET must be at least 32 characters long');
+    }
+  }
+}
+
 function getEncryptionKey(): Buffer {
   const hexKey = process.env.ENCRYPTION_KEY || '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
   return Buffer.from(hexKey, 'hex');

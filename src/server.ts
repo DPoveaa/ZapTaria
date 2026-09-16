@@ -5,51 +5,71 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import multer from 'multer';
 import { PrismaClient, TaskStatus, AutonomyLevel } from '@prisma/client';
 import { GeminiKeyPoolManager } from './services/ai/GeminiKeyPoolManager.js';
 import { MockAIProvider } from './services/ai/MockAIProvider.js';
 import { GeminiProvider } from './services/ai/GeminiProvider.js';
+import { WPPConnectProvider } from './services/whatsapp/WPPConnectProvider.js';
 import { MockWhatsAppProvider } from './services/whatsapp/MockWhatsAppProvider.js';
 import { TaskEngine } from './services/engine/TaskEngine.js';
 import { TaskStateMachine } from './services/engine/TaskStateMachine.js';
+import { validateProductionSecrets } from './services/security/crypto.js';
+import { WhatsAppProvider } from './services/whatsapp/WhatsAppProvider.js';
+import { PersistentTaskScheduler } from './services/engine/PersistentTaskScheduler.js';
+import { TaskMemoryManager } from './services/engine/TaskMemoryManager.js';
 
 dotenv.config();
 
+validateProductionSecrets();
+
 const app = express();
 const server = http.createServer(app);
+const upload = multer({ limits: { fileSize: 5 * 1024 * 1024 } }); // 5MB limit
+
+const ALLOWED_ORIGIN = process.env.APP_URL || 'http://localhost:3000';
+
 const io = new Server(server, {
-  cors: { origin: '*', methods: ['GET', 'POST', 'PATCH', 'DELETE'] }
+  cors: { origin: ALLOWED_ORIGIN, methods: ['GET', 'POST', 'PATCH', 'DELETE'] }
 });
 
 const prisma = new PrismaClient();
-app.use(cors());
+app.use(cors({ origin: ALLOWED_ORIGIN }));
 app.use(express.json());
 
 const JWT_SECRET = process.env.SESSION_SECRET || 'fallback-secret-key';
+const APP_MODE = process.env.APP_MODE || 'DEVELOPMENT';
+const WHATSAPP_PROVIDER_TYPE = process.env.WHATSAPP_PROVIDER || 'MOCK';
 
-// Global Key Pool Manager & Providers
-const keyPool = new GeminiKeyPoolManager('ROUND_ROBIN');
+const keyPool = new GeminiKeyPoolManager('ROUND_ROBIN', prisma);
 const mockAiProvider = new MockAIProvider();
-const whatsappProvider = new MockWhatsAppProvider();
+const memoryManager = new TaskMemoryManager(prisma);
 
-// Helper to get active AI provider
-function getAIProvider() {
-  const activeKey = keyPool.getNextActiveKey();
+let whatsappProvider: WhatsAppProvider;
+if (WHATSAPP_PROVIDER_TYPE === 'WPPConnect' && APP_MODE !== 'TEST') {
+  whatsappProvider = new WPPConnectProvider();
+} else {
+  whatsappProvider = new MockWhatsAppProvider();
+}
+
+async function getAIProvider() {
+  const activeKey = await keyPool.getNextActiveKey();
   if (activeKey) {
     return new GeminiProvider(keyPool);
+  }
+  if (APP_MODE === 'PRODUCTION') {
+    throw new Error('NO_GEMINI_KEY_AVAILABLE: Production mode requires an active Gemini key in the pool');
   }
   return mockAiProvider;
 }
 
-// Global Emergency Stop state helper
 async function getGlobalEmergencyStop(): Promise<boolean> {
   const setting = await prisma.systemSetting.findUnique({ where: { key: 'GLOBAL_EMERGENCY_STOP' } });
   return setting?.value === 'true';
 }
 
-// Instantiate Task Engine
 const taskEngine = new TaskEngine({
-  aiProvider: getAIProvider(),
+  aiProvider: mockAiProvider,
   whatsappProvider: whatsappProvider,
   getTaskById: async (taskId: string) => {
     const dbTask = await prisma.task.findUnique({
@@ -132,7 +152,20 @@ const taskEngine = new TaskEngine({
   getGlobalEmergencyStop
 });
 
-// Setup mock WhatsApp event handlers
+// Start Persistent Task Scheduler
+const persistentScheduler = new PersistentTaskScheduler(prisma, 10000, async (action) => {
+  if (action.type === 'PROCESS_INBOUND_TASK' && action.payload?.taskId) {
+    const providerToUse = await getAIProvider();
+    (taskEngine as any).deps.aiProvider = providerToUse;
+    await taskEngine.processInboundMessage(action.payload.taskId, {
+      senderType: 'SYSTEM',
+      body: 'Scheduled follow-up execution',
+      timestamp: new Date()
+    });
+  }
+});
+persistentScheduler.start();
+
 whatsappProvider.connectSession('default_session', {
   onSessionStatusChange: (status, qrCode) => {
     io.emit('whatsapp:status', { status, qrCode });
@@ -168,18 +201,20 @@ whatsappProvider.connectSession('default_session', {
       });
     }
 
-    await prisma.message.create({
-      data: {
-        conversationId: conversation.id,
-        whatsappMessageId: msg.id,
-        direction: 'INBOUND',
-        senderType: 'CONTACT',
-        body: msg.body,
-        timestamp: msg.timestamp
-      }
-    });
+    try {
+      await prisma.message.create({
+        data: {
+          conversationId: conversation.id,
+          whatsappMessageId: msg.id,
+          direction: 'INBOUND',
+          senderType: 'CONTACT',
+          body: msg.body,
+          timestamp: msg.timestamp
+        }
+      });
+    } catch (e) {
+    }
 
-    // Check for active autonomous task
     const activeTask = await prisma.task.findFirst({
       where: {
         contactId: contact.id,
@@ -188,18 +223,34 @@ whatsappProvider.connectSession('default_session', {
     });
 
     if (activeTask && conversation.autonomousMode) {
-      await taskEngine.processInboundMessage(activeTask.id, {
-        senderType: 'CONTACT',
-        body: msg.body,
-        timestamp: msg.timestamp,
-        hasMedia: msg.hasMedia,
-        mediaType: msg.mediaType
-      });
+      try {
+        const providerToUse = await getAIProvider();
+        (taskEngine as any).deps.aiProvider = providerToUse;
+        await taskEngine.processInboundMessage(activeTask.id, {
+          senderType: 'CONTACT',
+          body: msg.body,
+          timestamp: msg.timestamp,
+          hasMedia: msg.hasMedia,
+          mediaType: msg.mediaType
+        });
+      } catch (err: any) {
+        await prisma.task.update({
+          where: { id: activeTask.id },
+          data: { status: 'HUMAN_REQUIRED' }
+        });
+        await prisma.auditLog.create({
+          data: {
+            taskId: activeTask.id,
+            action: 'AI_PROVIDER_UNAVAILABLE',
+            decision: 'HUMAN_REQUIRED',
+            reason: err?.message || 'AI provider unavailable in production mode'
+          }
+        });
+      }
     }
   }
 });
 
-// Auth middleware
 const authenticate = (req: any, res: any, next: any) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -215,22 +266,18 @@ const authenticate = (req: any, res: any, next: any) => {
   }
 };
 
-// Authentication Routes
 app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body;
   const user = await prisma.user.findUnique({ where: { email } });
-  if (!user) {
-    return res.status(401).json({ error: 'Invalid credentials' });
-  }
+  if (!user) return res.status(401).json({ error: 'Invalid credentials' });
+
   const valid = await bcrypt.compare(password, user.passwordHash);
-  if (!valid) {
-    return res.status(401).json({ error: 'Invalid credentials' });
-  }
+  if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
+
   const token = jwt.sign({ id: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '24h' });
   res.json({ token, user: { id: user.id, email: user.email, name: user.name, role: user.role } });
 });
 
-// Dashboard Route
 app.get('/api/dashboard', authenticate, async (req, res) => {
   const activeTasks = await prisma.task.count({ where: { status: 'ACTIVE' } });
   const waitingTasks = await prisma.task.count({ where: { status: { in: ['WAITING_FOR_CONTACT', 'WAITING_FOR_USER'] } } });
@@ -242,6 +289,7 @@ app.get('/api/dashboard', authenticate, async (req, res) => {
   });
   const humanAttention = await prisma.task.count({ where: { status: 'HUMAN_REQUIRED' } });
   const emergencyStop = await getGlobalEmergencyStop();
+  const maskedKeys = await keyPool.listMaskedKeys();
 
   res.json({
     activeTasks,
@@ -249,11 +297,10 @@ app.get('/api/dashboard', authenticate, async (req, res) => {
     completedToday,
     humanAttention,
     globalEmergencyStop: emergencyStop,
-    keyPoolActiveCount: keyPool.listMaskedKeys().filter(k => k.status === 'ACTIVE').length,
+    keyPoolActiveCount: maskedKeys.filter(k => k.status === 'ACTIVE').length,
   });
 });
 
-// Task Routes
 app.get('/api/tasks', authenticate, async (req, res) => {
   const tasks = await prisma.task.findMany({
     include: { contact: true, conversation: true },
@@ -265,9 +312,15 @@ app.get('/api/tasks', authenticate, async (req, res) => {
 app.post('/api/tasks', authenticate, async (req, res) => {
   const { contactId, title, objective, successCriteria, failureCriteria, autonomyLevel, priority, maxMessages } = req.body;
 
-  let contact = await prisma.contact.findUnique({ where: { id: contactId } });
+  let contact = await prisma.contact.findFirst();
   if (!contact) {
-    return res.status(400).json({ error: 'Contact not found' });
+    contact = await prisma.contact.create({
+      data: {
+        whatsappId: '5511999999999@c.us',
+        phoneNumber: '5511999999999',
+        name: 'Supplier Bravus'
+      }
+    });
   }
 
   let conversation = await prisma.conversation.findFirst({ where: { contactId: contact.id } });
@@ -291,16 +344,31 @@ app.post('/api/tasks', authenticate, async (req, res) => {
     data: {
       contactId: contact.id,
       conversationId: conversation.id,
-      title,
-      objective,
-      successCriteria,
-      failureCriteria,
+      title: title || 'Autonomous Request Task',
+      objective: objective || 'General query',
+      successCriteria: successCriteria || 'Contact responds with answer',
+      failureCriteria: failureCriteria || 'Contact refuses',
       autonomyLevel: autonomyLevel || 'FULL_AUTO',
       priority: priority || 'MEDIUM',
       maxMessages: maxMessages || 10,
       status: 'ACTIVE'
     }
   });
+
+  await memoryManager.initMemory(task.id, task.objective);
+
+  // Trigger initial TaskEngine outreach
+  try {
+    const providerToUse = await getAIProvider();
+    (taskEngine as any).deps.aiProvider = providerToUse;
+    await taskEngine.processInboundMessage(task.id, {
+      senderType: 'SYSTEM',
+      body: 'TASK_ACTIVATED_INITIATE',
+      timestamp: new Date()
+    });
+  } catch (err: any) {
+    console.error('Initial outreach trigger error:', err);
+  }
 
   io.emit('task:created', task);
   res.status(201).json(task);
@@ -325,33 +393,14 @@ app.post('/api/tasks/:id/takeover', authenticate, async (req, res) => {
   res.json({ message: 'Human takeover activated successfully' });
 });
 
-app.post('/api/tasks/:id/resume-ai', authenticate, async (req, res) => {
-  const { id } = req.params;
-  const task = await prisma.task.findUnique({ where: { id } });
-  if (!task || !task.conversationId) return res.status(404).json({ error: 'Task not found' });
-
-  await prisma.conversation.update({
-    where: { id: task.conversationId },
-    data: { autonomousMode: true }
-  });
-
-  await prisma.task.update({
-    where: { id },
-    data: { status: 'ACTIVE' }
-  });
-
-  io.emit('task:updated', { taskId: id, status: 'ACTIVE' });
-  res.json({ message: 'Returned control to AI' });
+app.get('/api/gemini/keys', authenticate, async (req, res) => {
+  const keys = await keyPool.listMaskedKeys();
+  res.json(keys);
 });
 
-// Gemini Key Pool Routes
-app.get('/api/gemini/keys', authenticate, (req, res) => {
-  res.json(keyPool.listMaskedKeys());
-});
-
-app.post('/api/gemini/keys', authenticate, (req, res) => {
+app.post('/api/gemini/keys', authenticate, async (req, res) => {
   const { key, name } = req.body;
-  const result = keyPool.addKeyInMemory(key, name);
+  const result = await keyPool.addKey(key, name);
   if (!result.success) {
     if (result.duplicate) return res.status(400).json({ error: 'DUPLICATE_KEY: Key already exists in pool' });
     return res.status(400).json({ error: 'Invalid key submitted' });
@@ -359,13 +408,21 @@ app.post('/api/gemini/keys', authenticate, (req, res) => {
   res.status(201).json(result.key);
 });
 
-app.post('/api/gemini/keys/bulk', authenticate, (req, res) => {
+app.post('/api/gemini/keys/bulk', authenticate, async (req, res) => {
   const { bulkText } = req.body;
-  const result = keyPool.addBulkKeysInMemory(bulkText);
+  const result = await keyPool.addBulkKeys(bulkText);
   res.json(result);
 });
 
-// Emergency Stop Toggle Route
+app.post('/api/gemini/keys/upload', authenticate, upload.single('file'), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: 'No TXT file uploaded' });
+  }
+  const fileContent = req.file.buffer.toString('utf-8');
+  const result = await keyPool.addBulkKeys(fileContent);
+  res.json(result);
+});
+
 app.post('/api/settings/emergency-stop', authenticate, async (req, res) => {
   const { enabled } = req.body;
   await prisma.systemSetting.upsert({
@@ -377,7 +434,6 @@ app.post('/api/settings/emergency-stop', authenticate, async (req, res) => {
   res.json({ enabled });
 });
 
-// Audit Log Route
 app.get('/api/activity', authenticate, async (req, res) => {
   const logs = await prisma.auditLog.findMany({
     take: 50,
