@@ -25,7 +25,7 @@ export interface TaskRecord {
 }
 
 export interface TaskEngineDependencies {
-  aiProvider: AIProvider;
+  getAIProvider: () => Promise<AIProvider>;
   whatsappProvider: WhatsAppProvider;
   getTaskById: (taskId: string) => Promise<TaskRecord | null>;
   updateTaskStatus: (taskId: string, status: TaskStatus, updates?: Partial<TaskRecord>) => Promise<void>;
@@ -35,6 +35,8 @@ export interface TaskEngineDependencies {
   getGlobalEmergencyStop: () => Promise<boolean>;
 }
 
+export type ExecutionTriggerType = 'INBOUND_MESSAGE' | 'TASK_ACTIVATED' | 'SCHEDULED_FOLLOW_UP';
+
 export class TaskEngine {
   private deps: TaskEngineDependencies;
 
@@ -42,13 +44,17 @@ export class TaskEngine {
     this.deps = deps;
   }
 
-  public async processInboundMessage(taskId: string, inboundMsg: ContextMessage): Promise<void> {
+  public async processTaskExecution(
+    taskId: string,
+    triggerType: ExecutionTriggerType,
+    inboundMsg?: ContextMessage
+  ): Promise<void> {
     const task = await this.deps.getTaskById(taskId);
     if (!task) throw new Error(`Task ${taskId} not found`);
 
     const emergencyStop = await this.deps.getGlobalEmergencyStop();
 
-    // Check safety
+    // Outbound Safety Gate Check
     const safetyResult = SafetyGuardrails.validateOutgoingAction({
       taskStatus: task.status,
       autonomyLevel: task.autonomyLevel,
@@ -68,7 +74,7 @@ export class TaskEngine {
       return;
     }
 
-    // Build context
+    // Context Construction with Trigger Awareness
     const messages = await this.deps.getConversationMessages(task.whatsappChatId);
     const aiContext = ContextBuilder.buildContext(
       {
@@ -84,19 +90,19 @@ export class TaskEngine {
       inboundMsg
     );
 
-    // Evaluate AI Decision
-    const decision = await this.deps.aiProvider.evaluateConversation(aiContext);
+    // Resolve AI provider safely for this execution without global state mutation
+    const aiProvider = await this.deps.getAIProvider();
+    const decision = await aiProvider.evaluateConversation(aiContext);
 
     await this.deps.logAudit(
       taskId,
-      'AI_DECISION',
+      `AI_DECISION_${triggerType}`,
       decision.decision,
       `Reason: ${decision.reason} | Confidence: ${decision.confidence}`
     );
 
-    // Update state based on decision
+    // Decision Handling
     if (decision.decision === 'SEND_MESSAGE' && decision.reply) {
-      // Validate outgoing message text against safety filter
       const textSafety = SafetyGuardrails.validateOutgoingAction({
         taskStatus: task.status,
         autonomyLevel: task.autonomyLevel,
@@ -114,11 +120,9 @@ export class TaskEngine {
         return;
       }
 
-      // Send text via WhatsApp Provider
       await this.deps.whatsappProvider.sendText(task.whatsappChatId, decision.reply);
       await this.deps.saveMessage(task.whatsappChatId, 'AI', decision.reply);
 
-      // Increment message count
       const newCount = task.messageCount + 1;
       const targetStatus: TaskStatus = decision.taskStatus as TaskStatus;
 
@@ -149,5 +153,10 @@ export class TaskEngine {
       TaskStateMachine.assertTransition(task.status, 'HUMAN_REQUIRED');
       await this.deps.updateTaskStatus(taskId, 'HUMAN_REQUIRED');
     }
+  }
+
+  // Backward compatibility alias for inbound messages
+  public async processInboundMessage(taskId: string, inboundMsg: ContextMessage): Promise<void> {
+    return this.processTaskExecution(taskId, 'INBOUND_MESSAGE', inboundMsg);
   }
 }

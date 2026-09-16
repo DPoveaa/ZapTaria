@@ -8,8 +8,7 @@ import jwt from 'jsonwebtoken';
 import multer from 'multer';
 import { PrismaClient, TaskStatus, AutonomyLevel } from '@prisma/client';
 import { GeminiKeyPoolManager } from './services/ai/GeminiKeyPoolManager.js';
-import { MockAIProvider } from './services/ai/MockAIProvider.js';
-import { GeminiProvider } from './services/ai/GeminiProvider.js';
+import { AIProviderFactory } from './services/ai/AIProviderFactory.js';
 import { WPPConnectProvider } from './services/whatsapp/WPPConnectProvider.js';
 import { MockWhatsAppProvider } from './services/whatsapp/MockWhatsAppProvider.js';
 import { TaskEngine } from './services/engine/TaskEngine.js';
@@ -42,7 +41,7 @@ const APP_MODE = process.env.APP_MODE || 'DEVELOPMENT';
 const WHATSAPP_PROVIDER_TYPE = process.env.WHATSAPP_PROVIDER || 'MOCK';
 
 const keyPool = new GeminiKeyPoolManager('ROUND_ROBIN', prisma);
-const mockAiProvider = new MockAIProvider();
+const aiProviderFactory = new AIProviderFactory(keyPool);
 const memoryManager = new TaskMemoryManager(prisma);
 
 let whatsappProvider: WhatsAppProvider;
@@ -52,24 +51,13 @@ if (WHATSAPP_PROVIDER_TYPE === 'WPPConnect' && APP_MODE !== 'TEST') {
   whatsappProvider = new MockWhatsAppProvider();
 }
 
-async function getAIProvider() {
-  const activeKey = await keyPool.getNextActiveKey();
-  if (activeKey) {
-    return new GeminiProvider(keyPool);
-  }
-  if (APP_MODE === 'PRODUCTION') {
-    throw new Error('NO_GEMINI_KEY_AVAILABLE: Production mode requires an active Gemini key in the pool');
-  }
-  return mockAiProvider;
-}
-
 async function getGlobalEmergencyStop(): Promise<boolean> {
   const setting = await prisma.systemSetting.findUnique({ where: { key: 'GLOBAL_EMERGENCY_STOP' } });
   return setting?.value === 'true';
 }
 
 const taskEngine = new TaskEngine({
-  aiProvider: mockAiProvider,
+  getAIProvider: () => aiProviderFactory.getProvider(),
   whatsappProvider: whatsappProvider,
   getTaskById: async (taskId: string) => {
     const dbTask = await prisma.task.findUnique({
@@ -152,16 +140,9 @@ const taskEngine = new TaskEngine({
   getGlobalEmergencyStop
 });
 
-// Start Persistent Task Scheduler
 const persistentScheduler = new PersistentTaskScheduler(prisma, 10000, async (action) => {
   if (action.type === 'PROCESS_INBOUND_TASK' && action.payload?.taskId) {
-    const providerToUse = await getAIProvider();
-    (taskEngine as any).deps.aiProvider = providerToUse;
-    await taskEngine.processInboundMessage(action.payload.taskId, {
-      senderType: 'SYSTEM',
-      body: 'Scheduled follow-up execution',
-      timestamp: new Date()
-    });
+    await taskEngine.processTaskExecution(action.payload.taskId, 'SCHEDULED_FOLLOW_UP');
   }
 });
 persistentScheduler.start();
@@ -224,9 +205,7 @@ whatsappProvider.connectSession('default_session', {
 
     if (activeTask && conversation.autonomousMode) {
       try {
-        const providerToUse = await getAIProvider();
-        (taskEngine as any).deps.aiProvider = providerToUse;
-        await taskEngine.processInboundMessage(activeTask.id, {
+        await taskEngine.processTaskExecution(activeTask.id, 'INBOUND_MESSAGE', {
           senderType: 'CONTACT',
           body: msg.body,
           timestamp: msg.timestamp,
@@ -312,15 +291,13 @@ app.get('/api/tasks', authenticate, async (req, res) => {
 app.post('/api/tasks', authenticate, async (req, res) => {
   const { contactId, title, objective, successCriteria, failureCriteria, autonomyLevel, priority, maxMessages } = req.body;
 
-  let contact = await prisma.contact.findFirst();
+  if (!contactId) {
+    return res.status(400).json({ error: 'contactId is required to create a task' });
+  }
+
+  const contact = await prisma.contact.findUnique({ where: { id: contactId } });
   if (!contact) {
-    contact = await prisma.contact.create({
-      data: {
-        whatsappId: '5511999999999@c.us',
-        phoneNumber: '5511999999999',
-        name: 'Supplier Bravus'
-      }
-    });
+    return res.status(404).json({ error: `Contact with id '${contactId}' not found` });
   }
 
   let conversation = await prisma.conversation.findFirst({ where: { contactId: contact.id } });
@@ -357,15 +334,8 @@ app.post('/api/tasks', authenticate, async (req, res) => {
 
   await memoryManager.initMemory(task.id, task.objective);
 
-  // Trigger initial TaskEngine outreach
   try {
-    const providerToUse = await getAIProvider();
-    (taskEngine as any).deps.aiProvider = providerToUse;
-    await taskEngine.processInboundMessage(task.id, {
-      senderType: 'SYSTEM',
-      body: 'TASK_ACTIVATED_INITIATE',
-      timestamp: new Date()
-    });
+    await taskEngine.processTaskExecution(task.id, 'TASK_ACTIVATED');
   } catch (err: any) {
     console.error('Initial outreach trigger error:', err);
   }

@@ -3,15 +3,13 @@ import { AutonomyLevel, TaskStatus } from '@prisma/client';
 export interface SafetyCheckInput {
   taskStatus: TaskStatus;
   autonomyLevel: AutonomyLevel;
-  messageCount: IntNumber;
+  messageCount: number;
   maxMessages: number;
   deadlineAt?: Date | null;
   proposedMessage?: string | null;
   globalEmergencyStop?: boolean;
   humanTakeoverActive?: boolean;
 }
-
-type IntNumber = number;
 
 export interface SafetyValidationResult {
   isSafe: boolean;

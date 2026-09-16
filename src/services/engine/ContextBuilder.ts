@@ -24,9 +24,9 @@ export class ContextBuilder {
     task: ContextTaskInput,
     conversationSummary: string | null,
     messages: ContextMessage[],
-    latestInbound?: ContextMessage
+    inboundMsg?: ContextMessage,
+    taskMemory?: { goal?: string; knownFacts?: string[]; openQuestions?: string[]; contactCommitments?: string[] } | null
   ): AIProviderContext {
-    // Select recent relevant messages bounded by max limit
     const recentMessages = messages.slice(-this.MAX_MESSAGES).map(m => ({
       senderType: m.senderType,
       body: m.body,
@@ -35,18 +35,24 @@ export class ContextBuilder {
       mediaType: m.mediaType,
     }));
 
+    let summaryWithMemory = conversationSummary || '';
+    if (taskMemory) {
+      const memoryText = `Goal: ${taskMemory.goal || 'N/A'} | Facts: ${(taskMemory.knownFacts || []).join('; ')} | Commitments: ${(taskMemory.contactCommitments || []).join('; ')}`;
+      summaryWithMemory = summaryWithMemory ? `${summaryWithMemory}\nTask Memory: ${memoryText}` : `Task Memory: ${memoryText}`;
+    }
+
     return {
       taskObjective: `${task.title}: ${task.objective}`,
       successCriteria: task.successCriteria,
       failureCriteria: task.failureCriteria,
       constraints: task.constraints,
-      summary: conversationSummary,
+      summary: summaryWithMemory || 'None',
       conversationHistory: recentMessages,
-      latestMessage: latestInbound ? {
-        senderType: latestInbound.senderType,
-        body: latestInbound.body,
-        hasMedia: latestInbound.hasMedia,
-        mediaType: latestInbound.mediaType,
+      latestMessage: inboundMsg ? {
+        senderType: inboundMsg.senderType,
+        body: inboundMsg.body,
+        hasMedia: inboundMsg.hasMedia,
+        mediaType: inboundMsg.mediaType,
       } : undefined,
       currentTaskState: task.status,
       currentDateTime: new Date().toISOString(),

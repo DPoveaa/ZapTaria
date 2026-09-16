@@ -23,12 +23,25 @@ export function validateProductionSecrets(): void {
 }
 
 function getEncryptionKey(): Buffer {
-  const hexKey = process.env.ENCRYPTION_KEY || '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+  const hexKey = process.env.ENCRYPTION_KEY;
+  if (!hexKey) {
+    if (process.env.NODE_ENV === 'test' || process.env.APP_MODE === 'TEST') {
+      return Buffer.from('0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', 'hex');
+    }
+    throw new Error('FATAL_SECURITY_ERROR: ENCRYPTION_KEY is required');
+  }
   return Buffer.from(hexKey, 'hex');
 }
 
 function getFingerprintSecret(): string {
-  return process.env.KEY_FINGERPRINT_SECRET || '0123456789abcdef0123456789abcdef';
+  const secret = process.env.KEY_FINGERPRINT_SECRET;
+  if (!secret) {
+    if (process.env.NODE_ENV === 'test' || process.env.APP_MODE === 'TEST') {
+      return '0123456789abcdef0123456789abcdef';
+    }
+    throw new Error('FATAL_SECURITY_ERROR: KEY_FINGERPRINT_SECRET is required');
+  }
+  return secret;
 }
 
 export function normalizeKey(rawKey: string): string {

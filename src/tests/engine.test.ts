@@ -46,7 +46,7 @@ describe('Task Engine & State Machine Suite', () => {
     };
 
     const engine = new TaskEngine({
-      aiProvider,
+      getAIProvider: async () => aiProvider,
       whatsappProvider,
       getTaskById: async () => ({ ...taskRecord, status: currentStatus, messageCount }),
       updateTaskStatus: async (id, status, updates) => {

@@ -53,12 +53,24 @@ export class PersistentTaskScheduler {
     });
 
     for (const action of pending) {
-      // Idempotent locking - mark as processing
+      // Atomic DB Claim Mechanism: Only claim if status is still PENDING
       try {
-        await this.prisma.scheduledAction.update({
-          where: { id: action.id },
-          data: { status: 'PROCESSING', lastAttemptAt: now, attempts: { increment: 1 } }
+        const claimed = await this.prisma.scheduledAction.updateMany({
+          where: {
+            id: action.id,
+            status: 'PENDING'
+          },
+          data: {
+            status: 'PROCESSING',
+            lastAttemptAt: now,
+            attempts: { increment: 1 }
+          }
         });
+
+        if (claimed.count === 0) {
+          // Action was claimed by another worker tick
+          continue;
+        }
 
         if (this.onExecuteAction) {
           await this.onExecuteAction(action);
