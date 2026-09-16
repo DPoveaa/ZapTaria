@@ -4,21 +4,21 @@ const ALGORITHM = 'aes-256-gcm';
 const IV_LENGTH = 12;
 
 export function validateProductionSecrets(): void {
-  const isProd = process.env.NODE_ENV === 'production' || process.env.APP_MODE === 'PRODUCTION';
+  const isTest = process.env.NODE_ENV === 'test' || process.env.APP_MODE === 'TEST';
+  if (isTest) return;
+
   const encKey = process.env.ENCRYPTION_KEY;
   const fpSecret = process.env.KEY_FINGERPRINT_SECRET;
   const sessionSecret = process.env.SESSION_SECRET;
 
-  if (isProd) {
-    if (!encKey || encKey.length !== 64) {
-      throw new Error('FATAL_SECURITY_ERROR: ENCRYPTION_KEY must be a valid 64-character hex string (32 bytes)');
-    }
-    if (!fpSecret || fpSecret.length < 32) {
-      throw new Error('FATAL_SECURITY_ERROR: KEY_FINGERPRINT_SECRET must be at least 32 characters long');
-    }
-    if (!sessionSecret || sessionSecret.length < 32) {
-      throw new Error('FATAL_SECURITY_ERROR: SESSION_SECRET must be at least 32 characters long');
-    }
+  if (!encKey || encKey.length !== 64) {
+    throw new Error('FATAL_SECURITY_ERROR: ENCRYPTION_KEY must be a valid 64-character hex string (32 bytes)');
+  }
+  if (!fpSecret || fpSecret.length < 32) {
+    throw new Error('FATAL_SECURITY_ERROR: KEY_FINGERPRINT_SECRET must be at least 32 characters long');
+  }
+  if (!sessionSecret || sessionSecret.length < 32) {
+    throw new Error('FATAL_SECURITY_ERROR: SESSION_SECRET must be at least 32 characters long');
   }
 }
 

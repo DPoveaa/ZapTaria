@@ -13,7 +13,7 @@ export class GeminiProvider implements AIProvider {
   }
 
   public async evaluateConversation(context: AIProviderContext): Promise<AIDecisionContract> {
-    const activeKey = this.keyPool.getNextActiveKey();
+    const activeKey = await this.keyPool.getNextActiveKey();
     if (!activeKey) {
       throw new Error('NO_ACTIVE_GEMINI_KEY: No eligible Gemini API key available in key pool');
     }
@@ -34,14 +34,13 @@ export class GeminiProvider implements AIProvider {
 
       return validated;
     } catch (error: any) {
-      const isQuotaOrRateLimit = error?.status === 429 || error?.message?.includes('429') || error?.message?.includes('quota');
-      this.keyPool.recordError(activeKey.id, isQuotaOrRateLimit);
+      await this.keyPool.recordError(activeKey.id, error);
       throw error;
     }
   }
 
   public async generateObjectiveCriteria(objective: string): Promise<{ successCriteria: string; failureCriteria: string }> {
-    const activeKey = this.keyPool.getNextActiveKey();
+    const activeKey = await this.keyPool.getNextActiveKey();
     if (!activeKey) {
       return {
         successCriteria: 'Objective completed as requested by user',
