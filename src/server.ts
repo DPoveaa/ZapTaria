@@ -24,7 +24,7 @@ validateProductionSecrets();
 
 const app = express();
 const server = http.createServer(app);
-const upload = multer({ limits: { fileSize: 5 * 1024 * 1024 } }); // 5MB limit
+const upload = multer({ limits: { fileSize: 5 * 1024 * 1024 } });
 
 const ALLOWED_ORIGIN = process.env.APP_URL || 'http://localhost:3000';
 
@@ -36,7 +36,11 @@ const prisma = new PrismaClient();
 app.use(cors({ origin: ALLOWED_ORIGIN }));
 app.use(express.json());
 
-const JWT_SECRET = process.env.SESSION_SECRET || 'fallback-secret-key';
+const JWT_SECRET = process.env.SESSION_SECRET || (process.env.NODE_ENV === 'test' || process.env.APP_MODE === 'TEST' ? 'test-session-secret-key-32-chars-min' : '');
+if (!JWT_SECRET) {
+  throw new Error('FATAL_SECURITY_ERROR: SESSION_SECRET environment variable is missing');
+}
+
 const APP_MODE = process.env.APP_MODE || 'DEVELOPMENT';
 const WHATSAPP_PROVIDER_TYPE = process.env.WHATSAPP_PROVIDER || 'MOCK';
 
@@ -55,6 +59,24 @@ async function getGlobalEmergencyStop(): Promise<boolean> {
   const setting = await prisma.systemSetting.findUnique({ where: { key: 'GLOBAL_EMERGENCY_STOP' } });
   return setting?.value === 'true';
 }
+
+const persistentScheduler = new PersistentTaskScheduler(prisma, 10000, async (action) => {
+  if (action.type === 'PROCESS_SCHEDULED_FOLLOW_UP' && action.payload?.taskId) {
+    const task = await prisma.task.findUnique({
+      where: { id: action.payload.taskId },
+      include: { conversation: true }
+    });
+
+    if (!task) return;
+    if (task.status !== 'ACTIVE' && task.status !== 'WAITING_FOR_CONTACT') return;
+    if (task.conversation && !task.conversation.autonomousMode) return;
+
+    const emergencyStop = await getGlobalEmergencyStop();
+    if (emergencyStop) return;
+
+    await taskEngine.processTaskExecution(task.id, 'SCHEDULED_FOLLOW_UP');
+  }
+});
 
 const taskEngine = new TaskEngine({
   getAIProvider: () => aiProviderFactory.getProvider(),
@@ -109,21 +131,22 @@ const taskEngine = new TaskEngine({
       mediaType: m.mediaType
     }));
   },
-  saveMessage: async (chatId: string, senderType: 'AI' | 'USER' | 'CONTACT', body: string) => {
+  saveMessage: async (chatId: string, senderType: 'AI' | 'USER' | 'CONTACT', body: string, messageId?: string) => {
     let conversation = await prisma.conversation.findUnique({ where: { whatsappChatId: chatId } });
     if (!conversation) return;
 
+    const finalMsgId = messageId || 'msg_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
     await prisma.message.create({
       data: {
         conversationId: conversation.id,
-        whatsappMessageId: 'msg_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7),
+        whatsappMessageId: finalMsgId,
         direction: senderType === 'CONTACT' ? 'INBOUND' : 'OUTBOUND',
         senderType: senderType,
         body,
         timestamp: new Date()
       }
     });
-    io.emit('message:new', { conversationId: conversation.id, body, senderType });
+    io.emit('message:new', { conversationId: conversation.id, body, senderType, whatsappMessageId: finalMsgId });
   },
   logAudit: async (taskId: string, action: string, decision: string, reason: string) => {
     await prisma.auditLog.create({
@@ -137,98 +160,118 @@ const taskEngine = new TaskEngine({
     });
     io.emit('activity:logged', { taskId, action, decision, reason });
   },
+  scheduleFollowUp: async (taskId: string, scheduledFor: Date) => {
+    const idempotencyKey = `task:${taskId}:wait:${scheduledFor.getTime()}`;
+    await persistentScheduler.scheduleAction(taskId, 'PROCESS_SCHEDULED_FOLLOW_UP', scheduledFor, idempotencyKey, { taskId });
+  },
   getGlobalEmergencyStop
 });
 
-const persistentScheduler = new PersistentTaskScheduler(prisma, 10000, async (action) => {
-  if (action.type === 'PROCESS_INBOUND_TASK' && action.payload?.taskId) {
-    await taskEngine.processTaskExecution(action.payload.taskId, 'SCHEDULED_FOLLOW_UP');
-  }
-});
 persistentScheduler.start();
 
-whatsappProvider.connectSession('default_session', {
-  onSessionStatusChange: (status, qrCode) => {
-    io.emit('whatsapp:status', { status, qrCode });
-  },
-  onIncomingMessage: async (msg) => {
-    let contact = await prisma.contact.findUnique({ where: { whatsappId: msg.chatId } });
-    if (!contact) {
-      contact = await prisma.contact.create({
-        data: {
-          whatsappId: msg.chatId,
-          phoneNumber: msg.chatId.split('@')[0],
-          name: 'Contact ' + msg.chatId.split('@')[0]
-        }
-      });
-    }
-
-    let session = await prisma.whatsAppSession.findFirst();
-    if (!session) {
-      session = await prisma.whatsAppSession.create({
-        data: { name: 'Default Session', sessionName: 'default_session', status: 'CONNECTED' }
-      });
-    }
-
-    let conversation = await prisma.conversation.findUnique({ where: { whatsappChatId: msg.chatId } });
-    if (!conversation) {
-      conversation = await prisma.conversation.create({
-        data: {
-          whatsappSessionId: session.id,
-          contactId: contact.id,
-          whatsappChatId: msg.chatId,
-          lastMessageAt: msg.timestamp
-        }
-      });
-    }
-
-    try {
-      await prisma.message.create({
-        data: {
-          conversationId: conversation.id,
-          whatsappMessageId: msg.id,
-          direction: 'INBOUND',
-          senderType: 'CONTACT',
-          body: msg.body,
-          timestamp: msg.timestamp
-        }
-      });
-    } catch (e) {
-    }
-
-    const activeTask = await prisma.task.findFirst({
-      where: {
-        contactId: contact.id,
-        status: { in: ['ACTIVE', 'WAITING_FOR_CONTACT'] }
+// Connect WhatsApp Session Handlers
+const setupWhatsAppHandlers = (events?: any) => {
+  return {
+    onSessionStatusChange: async (status: string, qrCode?: string) => {
+      let session = await prisma.whatsAppSession.findFirst();
+      if (!session) {
+        session = await prisma.whatsAppSession.create({
+          data: { name: 'Default Session', sessionName: 'default_session', status: status as any, qrCode }
+        });
+      } else {
+        await prisma.whatsAppSession.update({
+          where: { id: session.id },
+          data: { status: status as any, qrCode, ...(status === 'CONNECTED' ? { connectedAt: new Date() } : {}) }
+        });
       }
-    });
-
-    if (activeTask && conversation.autonomousMode) {
-      try {
-        await taskEngine.processTaskExecution(activeTask.id, 'INBOUND_MESSAGE', {
-          senderType: 'CONTACT',
-          body: msg.body,
-          timestamp: msg.timestamp,
-          hasMedia: msg.hasMedia,
-          mediaType: msg.mediaType
-        });
-      } catch (err: any) {
-        await prisma.task.update({
-          where: { id: activeTask.id },
-          data: { status: 'HUMAN_REQUIRED' }
-        });
-        await prisma.auditLog.create({
+      io.emit('whatsapp:status', { status, qrCode });
+    },
+    onIncomingMessage: async (msg: any) => {
+      let contact = await prisma.contact.findUnique({ where: { whatsappId: msg.chatId } });
+      if (!contact) {
+        contact = await prisma.contact.create({
           data: {
-            taskId: activeTask.id,
-            action: 'AI_PROVIDER_UNAVAILABLE',
-            decision: 'HUMAN_REQUIRED',
-            reason: err?.message || 'AI provider unavailable in production mode'
+            whatsappId: msg.chatId,
+            phoneNumber: msg.chatId.split('@')[0],
+            name: 'Contact ' + msg.chatId.split('@')[0]
           }
         });
       }
+
+      let session = await prisma.whatsAppSession.findFirst();
+      if (!session) {
+        session = await prisma.whatsAppSession.create({
+          data: { name: 'Default Session', sessionName: 'default_session', status: 'CONNECTED' }
+        });
+      }
+
+      let conversation = await prisma.conversation.findUnique({ where: { whatsappChatId: msg.chatId } });
+      if (!conversation) {
+        conversation = await prisma.conversation.create({
+          data: {
+            whatsappSessionId: session.id,
+            contactId: contact.id,
+            whatsappChatId: msg.chatId,
+            lastMessageAt: msg.timestamp
+          }
+        });
+      }
+
+      try {
+        await prisma.message.create({
+          data: {
+            conversationId: conversation.id,
+            whatsappMessageId: msg.id,
+            direction: 'INBOUND',
+            senderType: 'CONTACT',
+            body: msg.body,
+            timestamp: msg.timestamp
+          }
+        });
+      } catch (err: any) {
+        if (err?.code === 'P2002' || err?.message?.includes('unique constraint') || err?.message?.includes('Unique constraint failed')) {
+          return; // Safely ignore duplicate inbound message
+        }
+        console.error('Database error persisting inbound message:', err);
+        throw err;
+      }
+
+      const activeTask = await prisma.task.findFirst({
+        where: {
+          contactId: contact.id,
+          status: { in: ['ACTIVE', 'WAITING_FOR_CONTACT'] }
+        }
+      });
+
+      if (activeTask && conversation.autonomousMode) {
+        try {
+          await taskEngine.processTaskExecution(activeTask.id, 'INBOUND_MESSAGE', {
+            senderType: 'CONTACT',
+            body: msg.body,
+            timestamp: msg.timestamp,
+            hasMedia: msg.hasMedia,
+            mediaType: msg.mediaType
+          });
+        } catch (err: any) {
+          await prisma.task.update({
+            where: { id: activeTask.id },
+            data: { status: 'HUMAN_REQUIRED' }
+          });
+          await prisma.auditLog.create({
+            data: {
+              taskId: activeTask.id,
+              action: 'AI_PROVIDER_UNAVAILABLE',
+              decision: 'HUMAN_REQUIRED',
+              reason: err?.message || 'AI provider error during task execution'
+            }
+          });
+        }
+      }
     }
-  }
-});
+  };
+};
+
+whatsappProvider.connectSession('default_session', setupWhatsAppHandlers());
 
 const authenticate = (req: any, res: any, next: any) => {
   const authHeader = req.headers.authorization;
@@ -269,6 +312,7 @@ app.get('/api/dashboard', authenticate, async (req, res) => {
   const humanAttention = await prisma.task.count({ where: { status: 'HUMAN_REQUIRED' } });
   const emergencyStop = await getGlobalEmergencyStop();
   const maskedKeys = await keyPool.listMaskedKeys();
+  const session = await prisma.whatsAppSession.findFirst();
 
   res.json({
     activeTasks,
@@ -277,7 +321,98 @@ app.get('/api/dashboard', authenticate, async (req, res) => {
     humanAttention,
     globalEmergencyStop: emergencyStop,
     keyPoolActiveCount: maskedKeys.filter(k => k.status === 'ACTIVE').length,
+    whatsappStatus: session?.status || 'DISCONNECTED'
   });
+});
+
+app.get('/api/whatsapp/status', authenticate, async (req, res) => {
+  const session = await prisma.whatsAppSession.findFirst();
+  const status = await whatsappProvider.getSessionStatus('default_session');
+  const qrCode = await whatsappProvider.getQRCode('default_session');
+  res.json({
+    status: session?.status || status,
+    qrCode: session?.qrCode || qrCode,
+    sessionName: 'default_session',
+    connectedAt: session?.connectedAt
+  });
+});
+
+app.post('/api/whatsapp/connect', authenticate, async (req, res) => {
+  try {
+    await whatsappProvider.connectSession('default_session', setupWhatsAppHandlers());
+    res.json({ message: 'WhatsApp connection initiated' });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to connect WhatsApp session' });
+  }
+});
+
+app.post('/api/whatsapp/disconnect', authenticate, async (req, res) => {
+  try {
+    await whatsappProvider.disconnectSession('default_session');
+    let session = await prisma.whatsAppSession.findFirst();
+    if (session) {
+      await prisma.whatsAppSession.update({
+        where: { id: session.id },
+        data: { status: 'LOGGED_OUT', qrCode: null }
+      });
+    }
+    io.emit('whatsapp:status', { status: 'LOGGED_OUT', qrCode: null });
+    res.json({ message: 'WhatsApp session disconnected' });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to disconnect session' });
+  }
+});
+
+app.get('/api/whatsapp/contacts', authenticate, async (req, res) => {
+  try {
+    let contacts = await prisma.contact.findMany({ orderBy: { name: 'asc' } });
+    if (contacts.length === 0) {
+      const providerContacts = await whatsappProvider.getContacts();
+      for (const c of providerContacts) {
+        await prisma.contact.upsert({
+          where: { whatsappId: c.id },
+          update: { name: c.name, pushName: c.pushName },
+          create: {
+            whatsappId: c.id,
+            phoneNumber: c.phoneNumber,
+            name: c.name,
+            pushName: c.pushName
+          }
+        });
+      }
+      contacts = await prisma.contact.findMany({ orderBy: { name: 'asc' } });
+    }
+    res.json(contacts);
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to fetch WhatsApp contacts' });
+  }
+});
+
+app.get('/api/whatsapp/chats', authenticate, async (req, res) => {
+  try {
+    const conversations = await prisma.conversation.findMany({
+      include: { contact: true, messages: { take: 1, orderBy: { timestamp: 'desc' } } }
+    });
+    res.json(conversations);
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to fetch chats' });
+  }
+});
+
+app.get('/api/conversations', authenticate, async (req, res) => {
+  const conversations = await prisma.conversation.findMany({
+    include: { contact: true, tasks: true, messages: { take: 1, orderBy: { timestamp: 'desc' } } }
+  });
+  res.json(conversations);
+});
+
+app.get('/api/conversations/:id/messages', authenticate, async (req, res) => {
+  const { id } = req.params;
+  const messages = await prisma.message.findMany({
+    where: { conversationId: id },
+    orderBy: { timestamp: 'asc' }
+  });
+  res.json(messages);
 });
 
 app.get('/api/tasks', authenticate, async (req, res) => {
@@ -359,8 +494,13 @@ app.post('/api/tasks/:id/takeover', authenticate, async (req, res) => {
     data: { status: 'HUMAN_REQUIRED' }
   });
 
+  await prisma.scheduledAction.updateMany({
+    where: { taskId: id, status: 'PENDING' },
+    data: { status: 'CANCELLED' }
+  });
+
   io.emit('task:updated', { taskId: id, status: 'HUMAN_REQUIRED' });
-  res.json({ message: 'Human takeover activated successfully' });
+  res.json({ message: 'Human takeover activated successfully and pending scheduled actions cancelled' });
 });
 
 app.get('/api/gemini/keys', authenticate, async (req, res) => {
@@ -405,6 +545,15 @@ app.post('/api/settings/emergency-stop', authenticate, async (req, res) => {
 });
 
 app.get('/api/activity', authenticate, async (req, res) => {
+  const logs = await prisma.auditLog.findMany({
+    take: 50,
+    orderBy: { createdAt: 'desc' },
+    include: { task: true, conversation: true }
+  });
+  res.json(logs);
+});
+
+app.get('/api/audit-logs', authenticate, async (req, res) => {
   const logs = await prisma.auditLog.findMany({
     take: 50,
     orderBy: { createdAt: 'desc' },

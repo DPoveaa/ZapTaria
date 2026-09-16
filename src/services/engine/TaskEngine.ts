@@ -33,6 +33,8 @@ export interface TaskEngineDependencies {
   saveMessage: (chatId: string, senderType: 'AI' | 'USER' | 'CONTACT', body: string) => Promise<void>;
   logAudit: (taskId: string, action: string, decision: string, reason: string) => Promise<void>;
   getGlobalEmergencyStop: () => Promise<boolean>;
+  scheduleFollowUp?: (taskId: string, scheduledFor: Date) => Promise<void>;
+  getTaskMemory?: (taskId: string) => Promise<any>;
 }
 
 export type ExecutionTriggerType = 'INBOUND_MESSAGE' | 'TASK_ACTIVATED' | 'SCHEDULED_FOLLOW_UP';
@@ -74,7 +76,10 @@ export class TaskEngine {
       return;
     }
 
-    // Context Construction with Trigger Awareness
+    // Load Task Memory if available
+    const taskMemory = this.deps.getTaskMemory ? await this.deps.getTaskMemory(taskId) : null;
+
+    // Context Construction with Trigger Awareness & Task Memory
     const messages = await this.deps.getConversationMessages(task.whatsappChatId);
     const aiContext = ContextBuilder.buildContext(
       {
@@ -87,7 +92,8 @@ export class TaskEngine {
       },
       task.conversationSummary || null,
       messages,
-      inboundMsg
+      inboundMsg,
+      taskMemory
     );
 
     // Resolve AI provider safely for this execution without global state mutation
@@ -132,6 +138,11 @@ export class TaskEngine {
     } else if (decision.decision === 'WAIT') {
       TaskStateMachine.assertTransition(task.status, 'WAITING_FOR_CONTACT');
       await this.deps.updateTaskStatus(taskId, 'WAITING_FOR_CONTACT');
+
+      if (this.deps.scheduleFollowUp) {
+        const nextTime = decision.nextActionAt ? new Date(decision.nextActionAt) : new Date(Date.now() + 24 * 60 * 60 * 1000);
+        await this.deps.scheduleFollowUp(taskId, nextTime);
+      }
 
     } else if (decision.decision === 'COMPLETE') {
       if (decision.reply) {
