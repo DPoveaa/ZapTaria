@@ -42,10 +42,7 @@ export class GeminiProvider implements AIProvider {
   public async generateObjectiveCriteria(objective: string): Promise<{ successCriteria: string; failureCriteria: string }> {
     const activeKey = await this.keyPool.getNextActiveKey();
     if (!activeKey) {
-      return {
-        successCriteria: 'Objective completed as requested by user',
-        failureCriteria: 'Contact explicitly refuses or is unable to fulfill objective'
-      };
+      throw new Error('NO_ACTIVE_GEMINI_KEY: Cannot generate objective criteria when Gemini is unavailable');
     }
 
     try {
@@ -71,11 +68,9 @@ Return JSON matching:
         successCriteria: parsed.successCriteria || 'Objective completed',
         failureCriteria: parsed.failureCriteria || 'Objective failed or refused'
       };
-    } catch (err) {
-      return {
-        successCriteria: 'Objective completed as requested',
-        failureCriteria: 'Contact explicitly refuses or is unable to fulfill objective'
-      };
+    } catch (err: any) {
+      await this.keyPool.recordError(activeKey.id, err);
+      throw new Error(`GEMINI_CRITERIA_GENERATION_FAILED: ${err?.message || 'Failed to generate criteria'}`);
     }
   }
 

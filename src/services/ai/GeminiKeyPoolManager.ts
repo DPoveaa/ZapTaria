@@ -99,7 +99,10 @@ export class GeminiKeyPoolManager {
         return { success: false, duplicate: false };
       }
     } else {
-      // In-memory fallback
+      const appMode = process.env.APP_MODE || 'DEVELOPMENT';
+      if (appMode !== 'TEST') {
+        throw new Error('DATABASE_REQUIRED: In-memory key pool fallback is only permitted when APP_MODE=TEST');
+      }
       for (const rec of this.inMemoryFallback.values()) {
         if (rec.keyFingerprint === fingerprint) return { success: false, duplicate: true };
       }
@@ -190,7 +193,10 @@ export class GeminiKeyPoolManager {
       const plaintextKey = decryptKey(selected.encryptedKey);
       return { id: selected.id, plaintextKey };
     } else {
-      // In-memory fallback
+      const appMode = process.env.APP_MODE || 'DEVELOPMENT';
+      if (appMode !== 'TEST') {
+        throw new Error('DATABASE_REQUIRED: In-memory key pool fallback is only permitted when APP_MODE=TEST');
+      }
       const eligible = Array.from(this.inMemoryFallback.values()).filter(
         k => k.status === 'ACTIVE' && (!k.cooldownUntil || k.cooldownUntil <= now)
       );
@@ -267,6 +273,10 @@ export class GeminiKeyPoolManager {
       const keys = await this.prisma.geminiKey.findMany({ orderBy: { createdAt: 'desc' } });
       return keys.map(k => this.toMaskedMetadata(k));
     } else {
+      const appMode = process.env.APP_MODE || 'DEVELOPMENT';
+      if (appMode !== 'TEST') {
+        throw new Error('DATABASE_REQUIRED: In-memory key pool fallback is only permitted when APP_MODE=TEST');
+      }
       return Array.from(this.inMemoryFallback.values()).map(k => this.toMaskedMetadata(k));
     }
   }

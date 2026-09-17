@@ -1,8 +1,12 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import { encryptKey, decryptKey, calculateKeyFingerprint, maskKey } from '../services/security/crypto.js';
 import { GeminiKeyPoolManager } from '../services/ai/GeminiKeyPoolManager.js';
 
 describe('Security Crypto & Key Pool', () => {
+  beforeEach(() => {
+    process.env.APP_MODE = 'TEST';
+  });
+
   it('should encrypt and decrypt keys accurately', () => {
     const rawKey = 'AIzaSyDummyTestKey1234567890';
     const encrypted = encryptKey(rawKey);

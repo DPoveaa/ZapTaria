@@ -52,8 +52,15 @@ export class WPPConnectProvider implements WhatsAppProvider {
         logQR: false,
       } as any);
 
-      this.status = 'CONNECTED';
-      events?.onSessionStatusChange?.('CONNECTED');
+      const isConnected = await this.client.isConnected().catch(() => false);
+      if (isConnected) {
+        this.status = 'CONNECTED';
+        this.qrCode = null;
+        events?.onSessionStatusChange?.('CONNECTED');
+      } else if ((this.status as WhatsAppSessionStatus) !== 'QR_CODE') {
+        this.status = 'CONNECTING';
+        events?.onSessionStatusChange?.('CONNECTING');
+      }
 
       this.client.onMessage((msg) => {
         if (!events?.onIncomingMessage) return;

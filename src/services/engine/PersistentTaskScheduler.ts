@@ -5,6 +5,7 @@ export class PersistentTaskScheduler {
   private intervalMs: number;
   private timer: NodeJS.Timeout | null = null;
   private onExecuteAction?: (action: any) => Promise<void>;
+  public static readonly MAX_ATTEMPTS = 3;
 
   constructor(prisma: PrismaClient, intervalMs: number = 10000, onExecuteAction?: (action: any) => Promise<void>) {
     this.prisma = prisma;
@@ -81,10 +82,11 @@ export class PersistentTaskScheduler {
           data: { status: 'COMPLETED', completedAt: new Date() }
         });
       } catch (err: any) {
+        const updatedAttempts = action.attempts + 1;
         await this.prisma.scheduledAction.update({
           where: { id: action.id },
           data: {
-            status: action.attempts >= 3 ? 'FAILED' : 'PENDING',
+            status: updatedAttempts >= PersistentTaskScheduler.MAX_ATTEMPTS ? 'FAILED' : 'PENDING',
             error: err?.message || 'Execution failed'
           }
         });
