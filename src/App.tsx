@@ -4,15 +4,15 @@ import {
   Key, MessageSquare, ShieldAlert, Users, LayoutDashboard, Settings, Activity, Plus,
   QrCode, RefreshCw, Upload, LogOut, Lock, Mail
 } from 'lucide-react';
-import { api, setAuthToken, removeAuthToken } from './services/api.js';
+import { api, setAuthToken, removeAuthToken, getApiUrl } from './services/api.js';
 import { io } from 'socket.io-client';
 
 export default function App() {
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(() => {
     return Boolean(localStorage.getItem('zaptaria_jwt_token'));
   });
-  const [loginEmail, setLoginEmail] = useState('admin@zaptaria.com');
-  const [loginPassword, setLoginPassword] = useState('admin123');
+  const [loginEmail, setLoginEmail] = useState('');
+  const [loginPassword, setLoginPassword] = useState('');
   const [loginError, setLoginError] = useState<string | null>(null);
   const [loginLoading, setLoginLoading] = useState(false);
 
@@ -171,7 +171,8 @@ function AuthenticatedApp({ onLogout }: { onLogout: () => void }) {
   useEffect(() => {
     fetchAllData();
 
-    const socket = io(window.location.origin, {
+    const socketUrl = getApiUrl();
+    const socket = io(socketUrl, {
       transports: ['websocket', 'polling']
     });
 

@@ -1,4 +1,15 @@
-const API_BASE = '/api';
+export const getApiUrl = (): string => {
+  if (typeof window !== 'undefined' && (window as any)._env_?.VITE_API_URL) {
+    return (window as any)._env_.VITE_API_URL;
+  }
+  const metaEnv = (import.meta as any).env;
+  if (metaEnv?.VITE_API_URL) {
+    return metaEnv.VITE_API_URL;
+  }
+  return 'http://localhost:5000';
+};
+
+const API_BASE = `${getApiUrl()}/api`;
 
 function getAuthToken(): string | null {
   return localStorage.getItem('zaptaria_jwt_token');

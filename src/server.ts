@@ -136,17 +136,30 @@ const taskEngine = new TaskEngine({
     if (!conversation) return;
 
     const finalMsgId = messageId || 'msg_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
-    await prisma.message.create({
-      data: {
-        conversationId: conversation.id,
-        whatsappMessageId: finalMsgId,
-        direction: senderType === 'CONTACT' ? 'INBOUND' : 'OUTBOUND',
-        senderType: senderType,
-        body,
-        timestamp: new Date()
+
+    if (messageId) {
+      const existingMsg = await prisma.message.findUnique({ where: { whatsappMessageId: messageId } });
+      if (existingMsg) return;
+    }
+
+    try {
+      await prisma.message.create({
+        data: {
+          conversationId: conversation.id,
+          whatsappMessageId: finalMsgId,
+          direction: senderType === 'CONTACT' ? 'INBOUND' : 'OUTBOUND',
+          senderType: senderType,
+          body,
+          timestamp: new Date()
+        }
+      });
+      io.emit('message:new', { conversationId: conversation.id, body, senderType, whatsappMessageId: finalMsgId });
+    } catch (err: any) {
+      if (err?.code === 'P2002' || err?.message?.includes('unique constraint')) {
+        return;
       }
-    });
-    io.emit('message:new', { conversationId: conversation.id, body, senderType, whatsappMessageId: finalMsgId });
+      throw err;
+    }
   },
   logAudit: async (taskId: string, action: string, decision: string, reason: string) => {
     await prisma.auditLog.create({
@@ -170,7 +183,7 @@ const taskEngine = new TaskEngine({
 persistentScheduler.start();
 
 // Connect WhatsApp Session Handlers
-const setupWhatsAppHandlers = (events?: any) => {
+const setupWhatsAppHandlers = () => {
   return {
     onSessionStatusChange: async (status: string, qrCode?: string) => {
       let session = await prisma.whatsAppSession.findFirst();
@@ -201,7 +214,7 @@ const setupWhatsAppHandlers = (events?: any) => {
       let session = await prisma.whatsAppSession.findFirst();
       if (!session) {
         session = await prisma.whatsAppSession.create({
-          data: { name: 'Default Session', sessionName: 'default_session', status: 'CONNECTED' }
+          data: { name: 'Default Session', sessionName: 'default_session', status: 'DISCONNECTED' }
         });
       }
 
@@ -239,6 +252,7 @@ const setupWhatsAppHandlers = (events?: any) => {
       const activeTask = await prisma.task.findFirst({
         where: {
           contactId: contact.id,
+          conversationId: conversation.id,
           status: { in: ['ACTIVE', 'WAITING_FOR_CONTACT'] }
         }
       });
@@ -271,6 +285,7 @@ const setupWhatsAppHandlers = (events?: any) => {
   };
 };
 
+// Initial background session setup
 whatsappProvider.connectSession('default_session', setupWhatsAppHandlers());
 
 const authenticate = (req: any, res: any, next: any) => {
@@ -290,6 +305,10 @@ const authenticate = (req: any, res: any, next: any) => {
 
 app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body;
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Email and password are required' });
+  }
+
   const user = await prisma.user.findUnique({ where: { email } });
   if (!user) return res.status(401).json({ error: 'Invalid credentials' });
 
@@ -312,7 +331,7 @@ app.get('/api/dashboard', authenticate, async (req, res) => {
   const humanAttention = await prisma.task.count({ where: { status: 'HUMAN_REQUIRED' } });
   const emergencyStop = await getGlobalEmergencyStop();
   const maskedKeys = await keyPool.listMaskedKeys();
-  const session = await prisma.whatsAppSession.findFirst();
+  const providerStatus = await whatsappProvider.getSessionStatus('default_session');
 
   res.json({
     activeTasks,
@@ -321,17 +340,25 @@ app.get('/api/dashboard', authenticate, async (req, res) => {
     humanAttention,
     globalEmergencyStop: emergencyStop,
     keyPoolActiveCount: maskedKeys.filter(k => k.status === 'ACTIVE').length,
-    whatsappStatus: session?.status || 'DISCONNECTED'
+    whatsappStatus: providerStatus
   });
 });
 
 app.get('/api/whatsapp/status', authenticate, async (req, res) => {
-  const session = await prisma.whatsAppSession.findFirst();
-  const status = await whatsappProvider.getSessionStatus('default_session');
+  const providerStatus = await whatsappProvider.getSessionStatus('default_session');
   const qrCode = await whatsappProvider.getQRCode('default_session');
+
+  let session = await prisma.whatsAppSession.findFirst();
+  if (session && session.status !== providerStatus) {
+    session = await prisma.whatsAppSession.update({
+      where: { id: session.id },
+      data: { status: providerStatus as any, qrCode }
+    });
+  }
+
   res.json({
-    status: session?.status || status,
-    qrCode: session?.qrCode || qrCode,
+    status: providerStatus,
+    qrCode,
     sessionName: 'default_session',
     connectedAt: session?.connectedAt
   });
@@ -340,7 +367,8 @@ app.get('/api/whatsapp/status', authenticate, async (req, res) => {
 app.post('/api/whatsapp/connect', authenticate, async (req, res) => {
   try {
     await whatsappProvider.connectSession('default_session', setupWhatsAppHandlers());
-    res.json({ message: 'WhatsApp connection initiated' });
+    const status = await whatsappProvider.getSessionStatus('default_session');
+    res.json({ message: 'WhatsApp connection initiated', status });
   } catch (err: any) {
     res.status(500).json({ error: err?.message || 'Failed to connect WhatsApp session' });
   }
@@ -367,20 +395,23 @@ app.get('/api/whatsapp/contacts', authenticate, async (req, res) => {
   try {
     let contacts = await prisma.contact.findMany({ orderBy: { name: 'asc' } });
     if (contacts.length === 0) {
-      const providerContacts = await whatsappProvider.getContacts();
-      for (const c of providerContacts) {
-        await prisma.contact.upsert({
-          where: { whatsappId: c.id },
-          update: { name: c.name, pushName: c.pushName },
-          create: {
-            whatsappId: c.id,
-            phoneNumber: c.phoneNumber,
-            name: c.name,
-            pushName: c.pushName
-          }
-        });
+      const providerStatus = await whatsappProvider.getSessionStatus('default_session');
+      if (providerStatus === 'CONNECTED') {
+        const providerContacts = await whatsappProvider.getContacts();
+        for (const c of providerContacts) {
+          await prisma.contact.upsert({
+            where: { whatsappId: c.id },
+            update: { name: c.name, pushName: c.pushName },
+            create: {
+              whatsappId: c.id,
+              phoneNumber: c.phoneNumber,
+              name: c.name,
+              pushName: c.pushName
+            }
+          });
+        }
+        contacts = await prisma.contact.findMany({ orderBy: { name: 'asc' } });
       }
-      contacts = await prisma.contact.findMany({ orderBy: { name: 'asc' } });
     }
     res.json(contacts);
   } catch (err: any) {
@@ -435,12 +466,19 @@ app.post('/api/tasks', authenticate, async (req, res) => {
     return res.status(404).json({ error: `Contact with id '${contactId}' not found` });
   }
 
+  const providerStatus = await whatsappProvider.getSessionStatus('default_session');
+  if (providerStatus !== 'CONNECTED') {
+    return res.status(400).json({
+      error: `WHATSAPP_DISCONNECTED: Cannot activate task because WhatsApp is not connected (current state: ${providerStatus})`
+    });
+  }
+
   let conversation = await prisma.conversation.findFirst({ where: { contactId: contact.id } });
   if (!conversation) {
     let session = await prisma.whatsAppSession.findFirst();
     if (!session) {
       session = await prisma.whatsAppSession.create({
-        data: { name: 'Default Session', sessionName: 'default_session', status: 'CONNECTED' }
+        data: { name: 'Default Session', sessionName: 'default_session', status: 'DISCONNECTED' }
       });
     }
     conversation = await prisma.conversation.create({
@@ -472,7 +510,22 @@ app.post('/api/tasks', authenticate, async (req, res) => {
   try {
     await taskEngine.processTaskExecution(task.id, 'TASK_ACTIVATED');
   } catch (err: any) {
-    console.error('Initial outreach trigger error:', err);
+    console.error('Initial outreach execution error:', err);
+    await prisma.task.update({
+      where: { id: task.id },
+      data: { status: 'HUMAN_REQUIRED' }
+    });
+    await prisma.auditLog.create({
+      data: {
+        taskId: task.id,
+        action: 'TASK_ACTIVATION_FAILED',
+        decision: 'HUMAN_REQUIRED',
+        reason: err?.message || 'Failed during initial outreach execution'
+      }
+    });
+    return res.status(500).json({
+      error: `TASK_ACTIVATION_FAILED: ${err?.message || 'Execution failed during initial task activation'}`
+    });
   }
 
   io.emit('task:created', task);
@@ -562,9 +615,11 @@ app.get('/api/audit-logs', authenticate, async (req, res) => {
   res.json(logs);
 });
 
-const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => {
-  console.log(`ZapTaria Server listening on port ${PORT}`);
-});
+if (process.env.NODE_ENV !== 'test') {
+  const PORT = process.env.PORT || 5000;
+  server.listen(PORT, () => {
+    console.log(`ZapTaria Server listening on port ${PORT}`);
+  });
+}
 
 export { app, server, io };

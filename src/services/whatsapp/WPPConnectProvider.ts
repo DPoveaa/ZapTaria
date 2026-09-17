@@ -16,6 +16,7 @@ export class WPPConnectProvider implements WhatsAppProvider {
   private status: WhatsAppSessionStatus = 'CREATED';
   private qrCode: string | null = null;
   private sessionDataDir: string;
+  private connectionPromise: Promise<void> | null = null;
 
   constructor(sessionDataDir: string = '.wppconnect_sessions') {
     this.sessionDataDir = path.resolve(process.cwd(), sessionDataDir);
@@ -25,62 +26,78 @@ export class WPPConnectProvider implements WhatsAppProvider {
   }
 
   public async connectSession(sessionName: string, events?: WhatsAppProviderEvents): Promise<void> {
-    this.status = 'CONNECTING';
-    events?.onSessionStatusChange?.('CONNECTING');
-
-    try {
-      this.client = await wppconnect.create({
-        session: sessionName,
-        folderNameToken: this.sessionDataDir,
-        catchQR: (base64Qr: string) => {
-          this.qrCode = base64Qr;
-          this.status = 'QR_CODE';
-          events?.onSessionStatusChange?.('QR_CODE', base64Qr);
-        },
-        statusFind: (statusSession: string) => {
-          if (statusSession === 'isLogged' || statusSession === 'inChat') {
-            this.status = 'CONNECTED';
-            this.qrCode = null;
-            events?.onSessionStatusChange?.('CONNECTED');
-          } else if (statusSession === 'notLogged' || statusSession === 'desconnectedMobile') {
-            this.status = 'DISCONNECTED';
-            events?.onSessionStatusChange?.('DISCONNECTED');
-          }
-        },
-        headless: true,
-        useChrome: false,
-        logQR: false,
-      } as any);
-
-      const isConnected = await this.client.isConnected().catch(() => false);
-      if (isConnected) {
-        this.status = 'CONNECTED';
-        this.qrCode = null;
-        events?.onSessionStatusChange?.('CONNECTED');
-      } else if ((this.status as WhatsAppSessionStatus) !== 'QR_CODE') {
-        this.status = 'CONNECTING';
-        events?.onSessionStatusChange?.('CONNECTING');
-      }
-
-      this.client.onMessage((msg) => {
-        if (!events?.onIncomingMessage) return;
-        const normalized = this.normalizeMessage(msg);
-        events.onIncomingMessage(normalized);
-      });
-    } catch (err) {
-      this.status = 'DISCONNECTED';
-      events?.onSessionStatusChange?.('DISCONNECTED');
-      throw err;
+    if (this.status === 'CONNECTED' && this.client) {
+      events?.onSessionStatusChange?.('CONNECTED');
+      return;
     }
+
+    if (this.connectionPromise) {
+      return this.connectionPromise;
+    }
+
+    this.connectionPromise = (async () => {
+      this.status = 'CONNECTING';
+      events?.onSessionStatusChange?.('CONNECTING');
+
+      try {
+        this.client = await wppconnect.create({
+          session: sessionName,
+          folderNameToken: this.sessionDataDir,
+          catchQR: (base64Qr: string) => {
+            this.qrCode = base64Qr;
+            this.status = 'QR_CODE';
+            events?.onSessionStatusChange?.('QR_CODE', base64Qr);
+          },
+          statusFind: (statusSession: string) => {
+            if (statusSession === 'isLogged' || statusSession === 'inChat') {
+              this.status = 'CONNECTED';
+              this.qrCode = null;
+              events?.onSessionStatusChange?.('CONNECTED');
+            } else if (statusSession === 'notLogged' || statusSession === 'desconnectedMobile') {
+              this.status = 'DISCONNECTED';
+              events?.onSessionStatusChange?.('DISCONNECTED');
+            }
+          },
+          headless: true,
+          useChrome: false,
+          logQR: false,
+        } as any);
+
+        const isConnected = await this.client.isConnected().catch(() => false);
+        if (isConnected) {
+          this.status = 'CONNECTED';
+          this.qrCode = null;
+          events?.onSessionStatusChange?.('CONNECTED');
+        } else if ((this.status as WhatsAppSessionStatus) !== 'QR_CODE') {
+          this.status = 'CONNECTING';
+          events?.onSessionStatusChange?.('CONNECTING');
+        }
+
+        this.client.onMessage((msg) => {
+          if (!events?.onIncomingMessage) return;
+          const normalized = this.normalizeMessage(msg);
+          events.onIncomingMessage(normalized);
+        });
+      } catch (err) {
+        this.status = 'DISCONNECTED';
+        events?.onSessionStatusChange?.('DISCONNECTED');
+        throw err;
+      } finally {
+        this.connectionPromise = null;
+      }
+    })();
+
+    return this.connectionPromise;
   }
 
   public async disconnectSession(sessionName: string): Promise<void> {
     if (this.client) {
-      await this.client.logout();
-      await this.client.close();
+      await this.client.logout().catch(() => {});
+      await this.client.close().catch(() => {});
       this.client = null;
     }
     this.status = 'LOGGED_OUT';
+    this.qrCode = null;
   }
 
   public async getQRCode(sessionName: string): Promise<string | null> {
@@ -88,6 +105,12 @@ export class WPPConnectProvider implements WhatsAppProvider {
   }
 
   public async getSessionStatus(sessionName: string): Promise<WhatsAppSessionStatus> {
+    if (this.client) {
+      const isConnected = await this.client.isConnected().catch(() => false);
+      if (isConnected) {
+        this.status = 'CONNECTED';
+      }
+    }
     return this.status;
   }
 
